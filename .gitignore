@@ -1,0 +1,8 @@
+node_modules/
+.history/
+.pi/
+.pi-subagents/
+vendor/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

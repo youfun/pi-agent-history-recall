@@ -1,0 +1,2 @@
+{"type": "session", "id": "c631c659-9879-437c-97e7-1abc8bbccfa4", "cwd": "/tmp/other-project", "timestamp": "2026-07-01T00:00:00.000Z", "version": 3}
+{"type": "message", "id": "8f1ad635-9675-45d0-9be4-2e74ea598754", "parentId": null, "timestamp": "2026-07-13T10:11:15.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "secret other project"}]}}
