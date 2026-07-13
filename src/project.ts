@@ -41,45 +41,40 @@ export function sameProject(a: string, b: string): boolean {
  * Return the SQLite path for a project.
  *
  * Priority:
- * 1. `{cwd}/.pi/history-recall.sqlite` — colocated with project, never shared accidentally.
- * 2. `{agentDir}/history-recall/{projectId}.sqlite` — central fallback when the project
- *    directory is not writable (e.g. readonly mount, permission error).
+ * 1. `{cwd}/.pi/history-recall.sqlite` when project dir is writable.
+ * 2. `{agentDir}/history-recall/{projectId}.sqlite` fallback (tests / readonly mounts).
+ *
+ * When `agentDir` is provided (tests), always use the agentDir layout so fixtures
+ * stay isolated from the real project tree.
  */
 export function indexDbPath(projectId: string, cwd: string, agentDir?: string): string {
+  if (agentDir) {
+    return join(agentDir, "history-recall", `${projectId}.sqlite`);
+  }
+
   const localDir = join(cwd, ".pi");
   const localPath = join(localDir, "history-recall.sqlite");
-  try {
-    // Pre-flight: try to create the directory (mkdir returns first created path, or throws).
-    if (!isWritable(localDir)) throw new Error("local .pi not writable");
+  if (ensureWritableDir(localDir)) {
     return localPath;
-  } catch {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const base = agentDir ?? `${home}/.pi/agent`;
-    const fallback = `${base}/history-recall/${projectId}.sqlite`;
-    return fallback;
   }
+
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const base = `${home}/.pi/agent`;
+  return join(base, "history-recall", `${projectId}.sqlite`);
 }
 
-function isWritable(dir: string): boolean {
+function ensureWritableDir(dir: string): boolean {
   try {
-    if (!accessSync(dir, constants.W_OK)) {
-      // exists and writable
-      return true;
-    }
+    mkdirSync(dir, { recursive: true });
+    accessSync(dir, constants.W_OK);
     return true;
   } catch {
-    // doesn't exist — try to create it
-    try {
-      mkdirSync(dir, { recursive: true });
-      return true;
-    } catch {
-      return false;
-    }
+    return false;
   }
 }
 
 export function indexDir(agentDir?: string): string {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const base = agentDir ?? `${home}/.pi/agent`;
-  return `${base}/history-recall`;
+  return join(base, "history-recall");
 }

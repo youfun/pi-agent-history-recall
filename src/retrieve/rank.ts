@@ -58,13 +58,24 @@ export function scoreAxes(input: RankInputs): RankAxes {
     rrf += SOURCE_WEIGHT.traceTarget / (60 + 1);
   }
 
-  // rrf_max: all sources present at rank 1
-  rrfMax =
-    SOURCE_WEIGHT.latinFts / 61 +
-    SOURCE_WEIGHT.cjkFts / 61 +
-    SOURCE_WEIGHT.entity / 61 +
-    SOURCE_WEIGHT.constraint / 61 +
-    SOURCE_WEIGHT.traceTarget / 61;
+  // rrf_max: only count sources that actually participated.
+  // Compute as: rrf for the same participating sources if they each scored at rank 1.
+  {
+    if (input.latinRank > 0) rrfMax += SOURCE_WEIGHT.latinFts / 61;
+    if (input.cjkRank > 0) rrfMax += SOURCE_WEIGHT.cjkFts / 61;
+    if (input.entityHits > 0) rrfMax += SOURCE_WEIGHT.entity / 61;
+    if (input.constraintCount > 0) rrfMax += SOURCE_WEIGHT.constraint / 61;
+    if (input.traceHits > 0) rrfMax += SOURCE_WEIGHT.traceTarget / 61;
+  }
+  // Guard: if no source participated, fall back to the full set so we don't divide by zero.
+  if (rrfMax === 0) {
+    rrfMax =
+      SOURCE_WEIGHT.latinFts / 61 +
+      SOURCE_WEIGHT.cjkFts / 61 +
+      SOURCE_WEIGHT.entity / 61 +
+      SOURCE_WEIGHT.constraint / 61 +
+      SOURCE_WEIGHT.traceTarget / 61;
+  }
 
   const rrfNorm = rrfMax > 0 ? (100 * rrf) / rrfMax : 0;
 

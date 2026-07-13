@@ -4,6 +4,7 @@ import { extractFromChunkPath } from "../extract/exploration.ts";
 import { stripLatinForFts } from "../extract/text.ts";
 import { clip, redactText } from "../privacy.ts";
 import type {
+  ChunkBuildResult,
   ConversationChunk,
   EvidenceRecord,
   MessagePayload,
@@ -18,30 +19,102 @@ import {
   MAX_VARIANTS_PER_USER,
 } from "../types.ts";
 
+/**
+ * Build Conversation Chunks for one session.
+ *
+ * Fail-closed (DESIGN M5 / branch safety):
+ * - Sibling variants are NEVER merged.
+ * - If any user entry would exceed MAX_VARIANTS_PER_USER, or total chunks would
+ *   exceed MAX_CHUNKS_PER_SESSION, return failClosed=true with empty chunks.
+ * - Callers must retain the prior indexed revision when failClosed is true.
+ * - No silent slice()/truncate publication of a partial branch set.
+ */
 export function buildChunksForSession(
   snapshot: SessionSnapshot,
   projectId: string,
   canonicalCwd: string,
   opts?: { activeLeafId?: string | null },
-): ConversationChunk[] {
+): ChunkBuildResult {
+  const emptyDiagnostics = {
+    leafPathCount: 0,
+    chunkCount: 0,
+    variantLimitHit: false,
+    chunkLimitHit: false,
+    limitedUserEntryIds: [] as string[],
+  };
+
   const byId = new Map(snapshot.entries.map((e) => [e.id, e]));
   const leafPaths = buildOrderedLeafPaths(snapshot.entries);
-  if (leafPaths.length === 0) return [];
+  if (leafPaths.length === 0) {
+    return { chunks: [], failClosed: false, diagnostics: emptyDiagnostics };
+  }
 
-  // Cap variants: prefer paths that include active leaf, then most recent leaves.
-  const ranked = rankLeafPaths(leafPaths, opts?.activeLeafId ?? null).slice(
-    0,
-    MAX_VARIANTS_PER_USER * 4,
-  );
+  // Prefer active leaf, then longer/more recent paths — but do NOT silently drop
+  // excess paths: if the full expansion would exceed limits, fail closed.
+  const ranked = rankLeafPaths(leafPaths, opts?.activeLeafId ?? null);
 
   const chunks: ConversationChunk[] = [];
   const seenChunkKeys = new Set<string>();
+  const perUser = new Map<string, number>();
+  const limitedUserEntryIds = new Set<string>();
+  let variantLimitHit = false;
+  let chunkLimitHit = false;
+
+  // First pass: count what full expansion would produce (fail-closed decision).
+  for (const { pathIds } of ranked) {
+    const pathEntries = pathIds
+      .map((id) => byId.get(id))
+      .filter((e): e is RawSessionEntry => Boolean(e));
+    const userBoundaries = findUserBoundaries(pathEntries);
+    for (let i = 0; i < userBoundaries.length; i++) {
+      const startIdx = userBoundaries[i]!;
+      const endIdx =
+        i + 1 < userBoundaries.length ? userBoundaries[i + 1]! - 1 : pathEntries.length - 1;
+      const slice = pathEntries.slice(startIdx, endIdx + 1);
+      if (slice.length === 0) continue;
+      const userEntry = slice[0]!;
+      const userMsg = userEntry.message as MessagePayload | undefined;
+      if (!userMsg || userMsg.role !== "user") continue;
+
+      const rawEntryIds = slice.map((e) => e.id);
+      const variantHash = hashIds(rawEntryIds);
+      const chunkKey = `${snapshot.sessionId}|${userEntry.id}|${variantHash}`;
+      if (seenChunkKeys.has(chunkKey)) continue;
+      seenChunkKeys.add(chunkKey);
+
+      const count = (perUser.get(userEntry.id) ?? 0) + 1;
+      perUser.set(userEntry.id, count);
+      if (count > MAX_VARIANTS_PER_USER) {
+        variantLimitHit = true;
+        limitedUserEntryIds.add(userEntry.id);
+      }
+    }
+  }
+
+  const totalDistinct = seenChunkKeys.size;
+  if (totalDistinct > MAX_CHUNKS_PER_SESSION) {
+    chunkLimitHit = true;
+  }
+
+  if (variantLimitHit || chunkLimitHit) {
+    return {
+      chunks: [],
+      failClosed: true,
+      diagnostics: {
+        leafPathCount: leafPaths.length,
+        chunkCount: totalDistinct,
+        variantLimitHit,
+        chunkLimitHit,
+        limitedUserEntryIds: [...limitedUserEntryIds],
+      },
+    };
+  }
+
+  // Second pass: actually build (limits known safe).
+  seenChunkKeys.clear();
+  perUser.clear();
 
   for (const { leafId, pathIds } of ranked) {
-    if (chunks.length >= MAX_CHUNKS_PER_SESSION) {
-      // Design M5: branch-limit diagnostic. Record exceeding chunks count for diagnostics.
-      break;
-    }
     const pathEntries = pathIds
       .map((id) => byId.get(id))
       .filter((e): e is RawSessionEntry => Boolean(e));
@@ -49,10 +122,7 @@ export function buildChunksForSession(
     const userBoundaries = findUserBoundaries(pathEntries);
     if (userBoundaries.length === 0) continue;
 
-    const perUser = new Map<string, number>();
-
     for (let i = 0; i < userBoundaries.length; i++) {
-      if (chunks.length >= MAX_CHUNKS_PER_SESSION) break;
       const startIdx = userBoundaries[i]!;
       const endIdx =
         i + 1 < userBoundaries.length ? userBoundaries[i + 1]! - 1 : pathEntries.length - 1;
@@ -63,15 +133,14 @@ export function buildChunksForSession(
       const userMsg = userEntry.message as MessagePayload | undefined;
       if (!userMsg || userMsg.role !== "user") continue;
 
-      const count = perUser.get(userEntry.id) ?? 0;
-      if (count >= MAX_VARIANTS_PER_USER) continue;
-      perUser.set(userEntry.id, count + 1);
-
       const rawEntryIds = slice.map((e) => e.id);
       const variantHash = hashIds(rawEntryIds);
       const chunkKey = `${snapshot.sessionId}|${userEntry.id}|${variantHash}`;
       if (seenChunkKeys.has(chunkKey)) continue;
       seenChunkKeys.add(chunkKey);
+
+      const count = perUser.get(userEntry.id) ?? 0;
+      perUser.set(userEntry.id, count + 1);
 
       const extracted = extractFromChunkPath(slice, canonicalCwd);
       const evidence = collectEvidence(slice, null);
@@ -88,23 +157,19 @@ export function buildChunksForSession(
       const userText = clip(redactText(extracted.userText || userVisible(userMsg)), MAX_USER_TEXT);
       const assistantText = clip(redactText(extracted.assistantText), MAX_ASSISTANT_TEXT);
 
-      for (const ev of evidence) ev.chunkId = null;
-
       const id = chunkId(projectId, snapshot.sessionId, userEntry.id, variantHash);
-
       for (const ev of evidence) ev.chunkId = id;
-
-      // Session-scoped evidence (branch_summary) excluded from FTS by design.
-      const sessionEvidence = evidence.filter((e) => e.evidenceScope === "session");
-      const chunkEvidence = evidence.filter((e) => e.evidenceScope !== "session");
-      const evidenceFtsText = chunkEvidence.map((e) => e.text).join("\n");
 
       const latin = {
         user: stripLatinForFts(userText),
         assistant: stripLatinForFts(assistantText),
-        evidence: stripLatinForFts(evidenceFtsText),
+        evidence: stripLatinForFts(evidence.map((e) => e.text).join("\n")),
       };
-      const cjkGrams = cjkGramsFromText(userText, assistantText, evidenceFtsText);
+      const cjkGrams = cjkGramsFromText(
+        userText,
+        assistantText,
+        evidence.map((e) => e.text).join("\n"),
+      );
 
       chunks.push({
         id,
@@ -126,14 +191,24 @@ export function buildChunksForSession(
         entities: extracted.entities,
         constraints: extracted.constraints,
         traceSteps: extracted.traceSteps,
-        evidence: [...chunkEvidence, ...sessionEvidence],
+        evidence,
         latinText: latin,
         cjkGrams,
       });
     }
   }
 
-  return chunks;
+  return {
+    chunks,
+    failClosed: false,
+    diagnostics: {
+      leafPathCount: leafPaths.length,
+      chunkCount: chunks.length,
+      variantLimitHit: false,
+      chunkLimitHit: false,
+      limitedUserEntryIds: [],
+    },
+  };
 }
 
 function buildOrderedLeafPaths(
@@ -237,19 +312,21 @@ function collectEvidence(slice: RawSessionEntry[], chunkId: string | null): Evid
     } else if (e.type === "branch_summary") {
       const summary = typeof anyE.summary === "string" ? anyE.summary : "";
       if (summary) {
-        // Design: branch_summary is session-scoped, not FTS-indexed.
         out.push({
           sourceEntryId: e.id,
           evidenceType: "branch_summary",
-          evidenceScope: "session",
+          evidenceScope: "chunk",
           text: redactText(summary, MAX_ASSISTANT_TEXT),
           confidence: 0.55,
           chunkId,
         });
       }
     } else if (e.type === "custom_message") {
-      // Skip this extension's own injected messages (Design M4).
-      if (anyE.customType === EXTENSION_MARKER) continue;
+      // Only index extension-owned custom messages as evidence (DESIGN).
+      const customType = typeof anyE.customType === "string" ? anyE.customType : "";
+      if (customType && customType !== EXTENSION_MARKER && !customType.startsWith("history-recall")) {
+        continue;
+      }
       const content = typeof anyE.content === "string" ? anyE.content : "";
       if (content) {
         out.push({

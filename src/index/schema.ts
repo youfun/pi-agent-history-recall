@@ -50,18 +50,17 @@ CREATE INDEX IF NOT EXISTS idx_chunks_user_entry ON chunks(session_id, user_entr
 CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status);
 
 -- Latin FTS: porter stemmer for English, remove diacritics, prefix index length 2.
+-- Internal content storage so that row-level DELETE is supported.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts_latin USING fts5(
   user_text,
   assistant_text,
   evidence_text,
-  content='',
   tokenize='porter unicode61 remove_diacritics 2'
 );
 
 -- CJK FTS: unicode61 only; indexed via precomputed n-grams in the cjk_grams column.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts_cjk USING fts5(
   cjk_grams,
-  content='',
   tokenize='unicode61'
 );
 

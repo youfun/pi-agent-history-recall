@@ -214,10 +214,36 @@ export interface IndexDiagnostics {
   skippedMissingCwd: number;
   skippedForeign: number;
   skippedMalformed: number;
+  /** Sessions whose branch/variant limits forced fail-closed (prior revision retained). */
   skippedBranchLimit: number;
   dirtySessions: number;
   indexedSessions: number;
   indexedChunks: number;
+  /** Sessions skipped because another writer holds the lease. */
+  skippedLeaseBusy: number;
+  /** Hard project isolation failures (cwd/project_id mismatch). */
+  hardIsolationErrors: number;
+}
+
+export interface ChunkBuildDiagnostics {
+  leafPathCount: number;
+  chunkCount: number;
+  /** True when per-user variant cap would be exceeded for any user entry. */
+  variantLimitHit: boolean;
+  /** True when total chunks would exceed MAX_CHUNKS_PER_SESSION. */
+  chunkLimitHit: boolean;
+  /** user_entry_id values that hit the variant cap. */
+  limitedUserEntryIds: string[];
+}
+
+/**
+ * Result of building chunks for one session.
+ * failClosed=true means the new build must NOT replace a prior indexed revision.
+ */
+export interface ChunkBuildResult {
+  chunks: ConversationChunk[];
+  failClosed: boolean;
+  diagnostics: ChunkBuildDiagnostics;
 }
 
 export interface ReconcileResult {

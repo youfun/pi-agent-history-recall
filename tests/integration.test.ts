@@ -1,34 +1,34 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { encodeSessionDirName } from "../src/session/ingest.ts";
 import { resolveProjectIdentity } from "../src/project.ts";
 import { HistoryIndex, clearIndexCache } from "../src/index/store.ts";
 import { searchProjectHistory, readChunkDetail } from "../src/retrieve/search.ts";
+import {
+  foreignSession,
+  linearAuthSession,
+  linearDeliverySession,
+  resetIds,
+  resetTs,
+} from "./helpers/session-factory.ts";
 
 const PROJECT_CWD = "/Users/box/dev-code/pi-agent-history-recall";
-const FIXTURE_SRC = join(import.meta.dir, "fixtures");
 
 describe("integration: index + search", () => {
   let agentDir: string;
   let index: HistoryIndex;
 
   beforeAll(() => {
+    resetIds();
+    resetTs();
     agentDir = mkdtempSync(join(tmpdir(), "hist-recall-"));
     const sessionDir = join(agentDir, "sessions", encodeSessionDirName(PROJECT_CWD));
     mkdirSync(sessionDir, { recursive: true });
-    // Copy only the project fixture (not foreign)
-    for (const name of readdirSync(FIXTURE_SRC)) {
-      if (name.startsWith("foreign")) continue;
-      if (!name.endsWith(".jsonl")) continue;
-      cpSync(join(FIXTURE_SRC, name), join(sessionDir, name));
-    }
-    // Also plant a foreign session in the same dir to ensure isolation by header.cwd
-    const foreign = readdirSync(FIXTURE_SRC).find((n) => n.startsWith("foreign"));
-    if (foreign) {
-      cpSync(join(FIXTURE_SRC, foreign), join(sessionDir, foreign));
-    }
+    linearDeliverySession(PROJECT_CWD, sessionDir);
+    linearAuthSession(PROJECT_CWD, sessionDir);
+    foreignSession("/tmp/other-project", sessionDir);
 
     clearIndexCache();
     const project = resolveProjectIdentity(PROJECT_CWD);

@@ -18,6 +18,7 @@ import type {
 } from "../types.ts";
 import { EXTRACTOR_VERSION, REDACTION_VERSION, SCHEMA_VERSION } from "../types.ts";
 import { openDatabase, type SqlDatabase } from "./db.ts";
+import { acquireWriterLease, type LeaseHandle } from "./lease.ts";
 import { META_KEYS, SCHEMA_SQL } from "./schema.ts";
 
 export class HistoryIndex {
@@ -61,7 +62,6 @@ export class HistoryIndex {
   private ensureMeta(): void {
     const ver = this.getMeta(META_KEYS.schemaVersion);
     if (ver !== String(SCHEMA_VERSION)) {
-      // Schema version mismatch: full rebuild.
       this.db.exec(`
         DELETE FROM evidence;
         DELETE FROM trace_steps;
@@ -74,7 +74,6 @@ export class HistoryIndex {
         DELETE FROM chunks;
         DELETE FROM sessions;
       `);
-      // Also clear meta so we can re-validate project identity fresh.
       this.db.exec("DELETE FROM index_meta");
       this.setMeta(META_KEYS.schemaVersion, String(SCHEMA_VERSION));
     }
@@ -84,12 +83,14 @@ export class HistoryIndex {
     const existingCwd = this.getMeta(META_KEYS.canonicalCwd);
     if (existingProject !== null && existingProject !== this.project.projectId) {
       throw new Error(
-        `Project identity mismatch: database was created for project ${existingProject} but current cwd resolves to ${this.project.projectId}. The database cannot be reopened under a different project.`,
+        `history-recall isolation hard error: project_id mismatch ` +
+          `(db=${existingProject} expected=${this.project.projectId})`,
       );
     }
     if (existingCwd !== null && existingCwd !== this.project.canonicalCwd) {
       throw new Error(
-        `Canonical CWD mismatch: database records ${existingCwd} but current cwd resolves to ${this.project.canonicalCwd}.`,
+        `history-recall isolation hard error: canonical_cwd mismatch ` +
+          `(db=${existingCwd} expected=${this.project.canonicalCwd})`,
       );
     }
 
@@ -106,19 +107,16 @@ export class HistoryIndex {
     return row?.m ?? 0;
   }
 
+  /**
+   * Reconcile index with session files.
+   * Writer lease prevents concurrent Pi processes from stale overwrites.
+   * Fail-closed branch builds retain the prior indexed revision.
+   */
   reconcile(opts?: {
     agentDir?: string;
     activeSessionId?: string;
   }): ReconcileResult {
-    const diagnostics: IndexDiagnostics = {
-      skippedMissingCwd: 0,
-      skippedForeign: 0,
-      skippedMalformed: 0,
-      skippedBranchLimit: 0,
-      dirtySessions: 0,
-      indexedSessions: 0,
-      indexedChunks: 0,
-    };
+    const diagnostics = emptyDiagnostics();
 
     const sessionDir = projectSessionDir(this.project.canonicalCwd, opts?.agentDir);
     if (!existsSync(sessionDir)) {
@@ -128,6 +126,31 @@ export class HistoryIndex {
       return { diagnostics, changed: false };
     }
 
+    const lease = acquireWriterLease(this.dbPath);
+    if (!lease.ok) {
+      diagnostics.skippedLeaseBusy = 1;
+      diagnostics.indexedChunks = (
+        this.db.prepare("SELECT COUNT(*) AS c FROM chunks").get() as { c: number }
+      ).c;
+      diagnostics.indexedSessions = (
+        this.db.prepare("SELECT COUNT(*) AS c FROM sessions").get() as { c: number }
+      ).c;
+      return { diagnostics, changed: false };
+    }
+
+    try {
+      return this.reconcileUnderLease(sessionDir, diagnostics, opts, lease.handle);
+    } finally {
+      lease.handle.release();
+    }
+  }
+
+  private reconcileUnderLease(
+    sessionDir: string,
+    diagnostics: IndexDiagnostics,
+    opts: { agentDir?: string; activeSessionId?: string } | undefined,
+    _handle: LeaseHandle,
+  ): ReconcileResult {
     const files = listSessionFiles(sessionDir);
     const known = this.db
       .prepare("SELECT session_id, fingerprint, source_path FROM sessions")
@@ -151,16 +174,50 @@ export class HistoryIndex {
 
       diagnostics.dirtySessions += 1;
       const isActive = isActiveSessionPath(file.path, opts?.activeSessionId);
-      const snapshot = parseSessionFile(file.path, this.project.canonicalCwd, { isActive });
+      let snapshot: SessionSnapshot | null;
+      try {
+        snapshot = parseSessionFile(file.path, this.project.canonicalCwd, { isActive });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("isolation hard error")) {
+          diagnostics.hardIsolationErrors += 1;
+          continue;
+        }
+        diagnostics.skippedMalformed += 1;
+        continue;
+      }
+
       if (!snapshot) {
         diagnostics.skippedMalformed += 1;
         diagnostics.skippedForeign += 1;
         continue;
       }
-      this.upsertSession(snapshot, opts?.activeSessionId);
-      this.validateSession(snapshot.sessionId);
-      changed = true;
-      diagnostics.indexedSessions += 1;
+
+      if (snapshot.headerCwd !== this.project.canonicalCwd) {
+        diagnostics.hardIsolationErrors += 1;
+        continue;
+      }
+
+      // After lease acquire: skip if another writer already committed this fingerprint.
+      const reFp = fingerprintSession({
+        sourcePath: file.path,
+        mtimeNs: snapshot.mtimeNs,
+        sizeBytes: snapshot.sizeBytes,
+      });
+      const latestKnown = this.db
+        .prepare("SELECT fingerprint FROM sessions WHERE source_path = ?")
+        .get(file.path) as { fingerprint: string } | undefined;
+      if (latestKnown && latestKnown.fingerprint === reFp) {
+        diagnostics.indexedSessions += 1;
+        continue;
+      }
+
+      const applied = this.upsertSession(snapshot, opts?.activeSessionId, diagnostics);
+      if (applied) {
+        this.validateSession(snapshot.sessionId);
+        changed = true;
+        diagnostics.indexedSessions += 1;
+      }
     }
 
     for (const k of known) {
@@ -203,17 +260,39 @@ export class HistoryIndex {
     this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
   }
 
-  private upsertSession(snapshot: SessionSnapshot, activeSessionId?: string): void {
-    const chunks = buildChunksForSession(
+  /**
+   * Upsert one session. Returns true if a new revision was committed.
+   * On fail-closed branch build, retains prior revision and returns false.
+   */
+  private upsertSession(
+    snapshot: SessionSnapshot,
+    activeSessionId: string | undefined,
+    diagnostics: IndexDiagnostics,
+  ): boolean {
+    const build = buildChunksForSession(
       snapshot,
       this.project.projectId,
       this.project.canonicalCwd,
       { activeLeafId: null },
     );
 
+    if (build.failClosed) {
+      diagnostics.skippedBranchLimit += 1;
+      return false;
+    }
+
+    for (const c of build.chunks) {
+      if (c.projectId !== this.project.projectId) {
+        diagnostics.hardIsolationErrors += 1;
+        return false;
+      }
+    }
+
+    const chunks = build.chunks;
     const isActive = snapshot.sessionId === activeSessionId ? 1 : 0;
 
-    const run = () => {
+    this.db.exec("BEGIN");
+    try {
       this.deleteSession(snapshot.sessionId);
 
       this.db
@@ -246,12 +325,8 @@ export class HistoryIndex {
         }
         this.insertChunk(chunk, snapshot.sessionId);
       }
-    };
-
-    this.db.exec("BEGIN");
-    try {
-      run();
       this.db.exec("COMMIT");
+      return true;
     } catch (err) {
       this.db.exec("ROLLBACK");
       throw err;
@@ -286,32 +361,34 @@ export class HistoryIndex {
         JSON.stringify(chunk.rawEntryIds),
       );
 
-    // Insert into Latin FTS
+    // Include entity values (paths/symbols) in FTS so tool-arg-only paths are recallable.
+    const entityLatin = chunk.entities
+      .map((e) => e.value)
+      .join(" ")
+      .toLowerCase();
+    const latinEvidence = [chunk.latinText.evidence, entityLatin].filter(Boolean).join(" ");
+
     const latinRowid = this.nextLatinRowid++;
     this.db
       .prepare(
         `INSERT INTO chunk_fts_latin(rowid, user_text, assistant_text, evidence_text)
          VALUES (?, ?, ?, ?)`,
       )
-      .run(latinRowid, chunk.latinText.user, chunk.latinText.assistant, chunk.latinText.evidence);
+      .run(latinRowid, chunk.latinText.user, chunk.latinText.assistant, latinEvidence);
     this.db
       .prepare("INSERT INTO chunk_fts_latin_map(fts_rowid, chunk_id) VALUES (?, ?)")
       .run(latinRowid, chunk.id);
 
-    // Insert into CJK FTS
     if (chunk.cjkGrams) {
       const cjkRowid = this.nextCjkRowid++;
       this.db
-        .prepare(
-          `INSERT INTO chunk_fts_cjk(rowid, cjk_grams) VALUES (?, ?)`,
-        )
+        .prepare(`INSERT INTO chunk_fts_cjk(rowid, cjk_grams) VALUES (?, ?)`)
         .run(cjkRowid, chunk.cjkGrams);
       this.db
         .prepare("INSERT INTO chunk_fts_cjk_map(fts_rowid, chunk_id) VALUES (?, ?)")
         .run(cjkRowid, chunk.id);
     }
 
-    // Entities
     const insEnt = this.db.prepare(
       `INSERT INTO entities(chunk_id, entity_type, value, normalized_value, context, confidence, source_entry_id)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -328,7 +405,6 @@ export class HistoryIndex {
       );
     }
 
-    // Constraints
     const insCon = this.db.prepare(
       `INSERT INTO constraints(chunk_id, text, normalized_text, trigger_word, confidence, source_entry_id, extractor_version)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -345,7 +421,6 @@ export class HistoryIndex {
       );
     }
 
-    // Trace steps
     const insTrace = this.db.prepare(
       `INSERT INTO trace_steps(
         chunk_id, source_entry_id, result_entry_id, tool_call_id, tool_name,
@@ -369,7 +444,6 @@ export class HistoryIndex {
       );
     }
 
-    // Evidence
     const insEv = this.db.prepare(
       `INSERT INTO evidence(chunk_id, session_id, source_entry_id, evidence_type, evidence_scope, text, confidence)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -387,13 +461,7 @@ export class HistoryIndex {
     }
   }
 
-  /**
-   * Post-transaction integrity validation for a session (Design H5).
-   * Verifies FTS↔chunk consistency and constraint lookup presence.
-   * Throws on critical integrity violations so a dirty index is never served.
-   */
   private validateSession(sessionId: string): void {
-    // 1. Every FTS latin row maps to a valid chunk.
     const orphanLatin = (
       this.db
         .prepare(
@@ -409,7 +477,6 @@ export class HistoryIndex {
       );
     }
 
-    // 2. Every CJK FTS row maps to a valid chunk.
     const orphanCjk = (
       this.db
         .prepare(
@@ -425,7 +492,6 @@ export class HistoryIndex {
       );
     }
 
-    // 3. Complete chunks have at least one FTS entry.
     const missingFts = (
       this.db
         .prepare(
@@ -449,6 +515,20 @@ export class HistoryIndex {
   get database(): SqlDatabase {
     return this.db;
   }
+}
+
+function emptyDiagnostics(): IndexDiagnostics {
+  return {
+    skippedMissingCwd: 0,
+    skippedForeign: 0,
+    skippedMalformed: 0,
+    skippedBranchLimit: 0,
+    dirtySessions: 0,
+    indexedSessions: 0,
+    indexedChunks: 0,
+    skippedLeaseBusy: 0,
+    hardIsolationErrors: 0,
+  };
 }
 
 const cache = new Map<string, HistoryIndex>();
