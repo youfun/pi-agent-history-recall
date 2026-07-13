@@ -6,6 +6,8 @@
  * History is evidence — not fact.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerHistoryRecallCommand } from "./commands.ts";
+import { loadSettings } from "./config.ts";
 import { getIndexForCwd } from "./index/store.ts";
 import { searchProjectHistory } from "./retrieve/search.ts";
 import {
@@ -13,69 +15,20 @@ import {
   registerSearchProjectHistory,
 } from "./tools/search_project_history.ts";
 import { registerReadProjectHistory } from "./tools/read_project_history.ts";
-import {
-  EXTENSION_MARKER,
-  HINT_MIN_CONFIDENCE,
-  HINT_MIN_RELEVANCE,
-} from "./types.ts";
+import { EXTENSION_MARKER } from "./types.ts";
 
 export default function (pi: ExtensionAPI) {
   registerSearchProjectHistory(pi);
   registerReadProjectHistory(pi);
   registerHistorySearchAlias(pi);
-
-  pi.registerCommand("history-recall", {
-    description:
-      "Search this project's session history (evidence, not fact). Usage: /history-recall <query>",
-    getArgumentCompletions: () => null,
-    handler: async (args, ctx) => {
-      const query = (args ?? "").trim();
-      if (!query) {
-        ctx.ui.notify(
-          "Usage: /history-recall <query>\nTools: search_project_history, read_project_history",
-          "info",
-        );
-        return;
-      }
-      try {
-        const index = getIndexForCwd(ctx.cwd);
-        const recon = index.reconcile({
-          activeSessionId: ctx.sessionManager.getSessionId(),
-        });
-        const results = searchProjectHistory(index, {
-          query,
-          project: index.project,
-          maxResults: 5,
-          excludeOpen: true,
-        });
-        if (results.length === 0) {
-          ctx.ui.notify(
-            `No history matches for "${query}" (sessions indexed: ${recon.diagnostics.indexedSessions}).`,
-            "info",
-          );
-          return;
-        }
-        const text = results
-          .map(
-            (r, i) =>
-              `${i + 1}. R:${r.relevance} C:${r.confidence} F:${r.freshness}  ${r.chunkId.slice(0, 8)}…\n` +
-              `   ${r.userText.slice(0, 120).replace(/\n/g, " ")}\n` +
-              (r.files.length ? `   files: ${r.files.slice(0, 5).join(", ")}\n` : ""),
-          )
-          .join("\n");
-        ctx.ui.notify(text, "info");
-      } catch (err) {
-        ctx.ui.notify(
-          `history-recall failed: ${err instanceof Error ? err.message : String(err)}`,
-          "error",
-        );
-      }
-    },
-  });
+  registerHistoryRecallCommand(pi);
 
   // Lightweight hint only — never inject full history as fact.
   pi.on("before_agent_start", async (event, ctx) => {
     try {
+      const settings = loadSettings(ctx.cwd);
+      if (!settings.enabled || !settings.hintsEnabled) return;
+
       const prompt = (event.prompt ?? "").trim();
       if (!prompt || prompt.length < 4) return;
 
@@ -87,8 +40,10 @@ export default function (pi: ExtensionAPI) {
         query: prompt,
         project: index.project,
         maxResults: 1,
-        minRelevance: HINT_MIN_RELEVANCE,
-        minConfidence: HINT_MIN_CONFIDENCE,
+        minRelevance: settings.hintMinRelevance,
+        minConfidence: settings.hintMinConfidence,
+        freshnessHighDays: settings.freshnessHighDays,
+        freshnessMediumDays: settings.freshnessMediumDays,
         excludeSessionId: sessionId,
         excludeOpen: true,
       });

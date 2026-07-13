@@ -158,18 +158,23 @@ export function buildChunksForSession(
       const assistantText = clip(redactText(extracted.assistantText), MAX_ASSISTANT_TEXT);
 
       const id = chunkId(projectId, snapshot.sessionId, userEntry.id, variantHash);
-      for (const ev of evidence) ev.chunkId = id;
+      for (const ev of evidence) {
+        // Session-scoped evidence stays attached for read/debug but is not FTS-indexed.
+        if (ev.evidenceScope === "chunk") ev.chunkId = id;
+      }
+
+      // Only chunk-scoped evidence contributes to FTS (DESIGN: branch_summary is session-scoped).
+      const ftsEvidenceText = evidence
+        .filter((e) => e.evidenceScope === "chunk")
+        .map((e) => e.text)
+        .join("\n");
 
       const latin = {
         user: stripLatinForFts(userText),
         assistant: stripLatinForFts(assistantText),
-        evidence: stripLatinForFts(evidence.map((e) => e.text).join("\n")),
+        evidence: stripLatinForFts(ftsEvidenceText),
       };
-      const cjkGrams = cjkGramsFromText(
-        userText,
-        assistantText,
-        evidence.map((e) => e.text).join("\n"),
-      );
+      const cjkGrams = cjkGramsFromText(userText, assistantText, ftsEvidenceText);
 
       chunks.push({
         id,
@@ -310,21 +315,26 @@ function collectEvidence(slice: RawSessionEntry[], chunkId: string | null): Evid
         chunkId,
       });
     } else if (e.type === "branch_summary") {
+      // Session-scoped auxiliary evidence only — must NOT enter FTS or ranking (DESIGN).
       const summary = typeof anyE.summary === "string" ? anyE.summary : "";
       if (summary) {
         out.push({
           sourceEntryId: e.id,
           evidenceType: "branch_summary",
-          evidenceScope: "chunk",
+          evidenceScope: "session",
           text: redactText(summary, MAX_ASSISTANT_TEXT),
           confidence: 0.55,
-          chunkId,
+          chunkId: null,
         });
       }
     } else if (e.type === "custom_message") {
-      // Only index extension-owned custom messages as evidence (DESIGN).
+      // Exclude our own extension-marked messages to prevent self-hint FTS loops (DESIGN).
       const customType = typeof anyE.customType === "string" ? anyE.customType : "";
-      if (customType && customType !== EXTENSION_MARKER && !customType.startsWith("history-recall")) {
+      if (
+        customType === EXTENSION_MARKER ||
+        customType.startsWith("history-recall") ||
+        customType.startsWith(`${EXTENSION_MARKER}`)
+      ) {
         continue;
       }
       const content = typeof anyE.content === "string" ? anyE.content : "";

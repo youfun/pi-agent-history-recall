@@ -37,6 +37,7 @@ export function searchProjectHistory(index: HistoryIndex, options: SearchOptions
   const minRelevance = options.minRelevance ?? DEFAULT_MIN_RELEVANCE;
   const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const excludeOpen = options.excludeOpen !== false;
+  const groupSiblings = options.groupSiblings !== false;
   const now = Date.now();
 
   const queries = buildFtsMatchQueries(options.query);
@@ -234,6 +235,8 @@ export function searchProjectHistory(index: HistoryIndex, options: SearchOptions
       hasSuccessAfterError: successAfterError,
       endTs: row.end_ts,
       now,
+      highDays: options.freshnessHighDays,
+      mediumDays: options.freshnessMediumDays,
     });
 
     if (axes.relevance < minRelevance) continue;
@@ -259,6 +262,7 @@ export function searchProjectHistory(index: HistoryIndex, options: SearchOptions
     results.push({
       chunkId: row.id,
       sessionId: row.session_id,
+      userEntryId: row.user_entry_id,
       relevance: axes.relevance,
       confidence: axes.confidence,
       freshness: axes.freshness,
@@ -287,7 +291,91 @@ export function searchProjectHistory(index: HistoryIndex, options: SearchOptions
     return b.endTs - a.endTs;
   });
 
-  return results.slice(0, maxResults);
+  if (!groupSiblings) {
+    return results.slice(0, maxResults);
+  }
+  return collapseSiblingGroups(results, maxResults);
+}
+
+/**
+ * Keep the highest-ranked variant per (sessionId, userEntryId) anchor.
+ * Sibling ids (from DB and from other ranked hits) are attached, never merged.
+ */
+function collapseSiblingGroups(results: RankedChunk[], maxResults: number): RankedChunk[] {
+  const seenAnchors = new Set<string>();
+  const out: RankedChunk[] = [];
+  for (const r of results) {
+    const anchor = `${r.sessionId}|${r.userEntryId}`;
+    if (seenAnchors.has(anchor)) continue;
+    seenAnchors.add(anchor);
+
+    // Collect other ranked hits under the same anchor as additional siblings.
+    const rankedSiblings = results
+      .filter(
+        (x) =>
+          x.chunkId !== r.chunkId &&
+          x.sessionId === r.sessionId &&
+          x.userEntryId === r.userEntryId,
+      )
+      .map((x) => x.chunkId);
+    const siblingSet = new Set([...r.siblingChunkIds, ...rankedSiblings]);
+    siblingSet.delete(r.chunkId);
+
+    out.push({
+      ...r,
+      siblingChunkIds: [...siblingSet],
+    });
+    if (out.length >= maxResults) break;
+  }
+  return out;
+}
+
+/** Format ranked results for tool / command display (sibling-aware). */
+export function formatSearchResults(results: RankedChunk[]): string {
+  if (results.length === 0) {
+    return "No project history matches. History is evidence — if empty, explore the code directly.";
+  }
+  const lines = results.map((r, i) => {
+    const parts = [
+      `[${i + 1}] Relevance: ${r.relevance} | Confidence: ${r.confidence} | Freshness: ${r.freshness}`,
+      `chunkId: ${r.chunkId}`,
+      `user: ${r.userText.replace(/\n/g, " ").slice(0, 200)}`,
+    ];
+    if (r.files.length) parts.push(`files: ${r.files.slice(0, 8).join(", ")}`);
+    if (r.symbols.length) parts.push(`symbols: ${r.symbols.slice(0, 8).join(", ")}`);
+    if (r.constraints.length) {
+      parts.push(
+        `constraints: ${r.constraints
+          .slice(0, 3)
+          .map((c) => c.text)
+          .join(" | ")}`,
+      );
+    }
+    if (r.exclusions.length) {
+      parts.push(
+        `exclusions: ${r.exclusions
+          .slice(0, 3)
+          .map((e) => e.text)
+          .join(" | ")}`,
+      );
+    }
+    if (r.siblingChunkIds.length) {
+      parts.push(
+        `siblings: ${r.siblingChunkIds.length} other variant(s) — not merged; top-ranked shown. ids: ${r.siblingChunkIds
+          .slice(0, 4)
+          .join(", ")}${r.siblingChunkIds.length > 4 ? "…" : ""}`,
+      );
+    }
+    if (r.assistantSnippet) {
+      parts.push(`snippet: ${r.assistantSnippet.replace(/\n/g, " ")}`);
+    }
+    parts.push("→ use read_project_history with this chunkId for full exploration trace");
+    return parts.join("\n");
+  });
+  return (
+    `Project history evidence (${results.length} chunk group(s)). Verify current code before modifying.\n\n` +
+    lines.join("\n\n")
+  );
 }
 
 function queryFts(

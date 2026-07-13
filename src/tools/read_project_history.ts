@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { loadSettings } from "../config.ts";
 import { getIndexForCwd } from "../index/store.ts";
 import { readChunkDetail } from "../retrieve/search.ts";
 import { clip } from "../privacy.ts";
@@ -29,6 +30,18 @@ export function registerReadProjectHistory(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext) {
       if (signal?.aborted) throw new Error("aborted");
       const p = params as { chunkId: string };
+      const settings = loadSettings(ctx.cwd);
+      if (!settings.enabled) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "history-recall is disabled (enabled=false). Enable via /history-recall settings or on.",
+            },
+          ],
+          details: { found: false, diagnostics: "disabled" },
+        };
+      }
       const index = getIndexForCwd(ctx.cwd);
       index.reconcile({ activeSessionId: ctx.sessionManager.getSessionId() });
 

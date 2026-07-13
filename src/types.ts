@@ -183,6 +183,7 @@ export interface ConversationChunk {
 export interface RankedChunk {
   chunkId: string;
   sessionId: string;
+  userEntryId: string;
   relevance: number;
   confidence: number;
   freshness: Freshness;
@@ -195,6 +196,7 @@ export interface RankedChunk {
   exclusions: Array<{ text: string; sourceEntryId: string }>;
   errorCount: number;
   hasVerification: boolean;
+  /** Other complete variants sharing the same user anchor (not merged). */
   siblingChunkIds: string[];
 }
 
@@ -208,6 +210,15 @@ export interface SearchOptions {
   excludeSessionId?: string;
   /** Exclude open chunks (always for safety). */
   excludeOpen?: boolean;
+  /** Freshness High bucket (days). */
+  freshnessHighDays?: number;
+  /** Freshness Medium bucket (days). */
+  freshnessMediumDays?: number;
+  /**
+   * When true (default), collapse sibling variants to the top-ranked one
+   * per user anchor and attach siblingChunkIds for the rest.
+   */
+  groupSiblings?: boolean;
 }
 
 export interface IndexDiagnostics {

@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { loadSettings } from "../config.ts";
 import { getIndexForCwd } from "../index/store.ts";
-import { searchProjectHistory } from "../retrieve/search.ts";
+import { formatSearchResults, searchProjectHistory } from "../retrieve/search.ts";
 import {
   DEFAULT_MAX_RESULTS,
   DEFAULT_MIN_CONFIDENCE,
@@ -56,6 +57,19 @@ export function registerSearchProjectHistory(pi: ExtensionAPI): void {
         minRelevance?: number;
         minConfidence?: number;
       };
+      const settings = loadSettings(ctx.cwd);
+      if (!settings.enabled) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "history-recall is disabled (enabled=false). Enable via /history-recall settings or on.",
+            },
+          ],
+          details: { results: [], diagnostics: "disabled" },
+        };
+      }
+
       const cwd = ctx.cwd;
       const index = getIndexForCwd(cwd);
       index.reconcile({ activeSessionId: ctx.sessionManager.getSessionId() });
@@ -64,8 +78,10 @@ export function registerSearchProjectHistory(pi: ExtensionAPI): void {
         query: p.query,
         project: index.project,
         maxResults: p.maxResults,
-        minRelevance: p.minRelevance,
-        minConfidence: p.minConfidence,
+        minRelevance: p.minRelevance ?? settings.minRelevance,
+        minConfidence: p.minConfidence ?? settings.minConfidence,
+        freshnessHighDays: settings.freshnessHighDays,
+        freshnessMediumDays: settings.freshnessMediumDays,
         excludeOpen: true,
       });
 
@@ -81,47 +97,11 @@ export function registerSearchProjectHistory(pi: ExtensionAPI): void {
         };
       }
 
-      const lines = results.map((r, i) => {
-        const parts = [
-          `[${i + 1}] Relevance: ${r.relevance} | Confidence: ${r.confidence} | Freshness: ${r.freshness}`,
-          `chunkId: ${r.chunkId}`,
-          `user: ${r.userText.replace(/\n/g, " ").slice(0, 200)}`,
-        ];
-        if (r.files.length) parts.push(`files: ${r.files.slice(0, 8).join(", ")}`);
-        if (r.symbols.length) parts.push(`symbols: ${r.symbols.slice(0, 8).join(", ")}`);
-        if (r.constraints.length) {
-          parts.push(
-            `constraints: ${r.constraints
-              .slice(0, 3)
-              .map((c) => c.text)
-              .join(" | ")}`,
-          );
-        }
-        if (r.exclusions.length) {
-          parts.push(
-            `exclusions: ${r.exclusions
-              .slice(0, 3)
-              .map((e) => e.text)
-              .join(" | ")}`,
-          );
-        }
-        if (r.siblingChunkIds.length) {
-          parts.push(`siblingVariants: ${r.siblingChunkIds.length}`);
-        }
-        if (r.assistantSnippet) {
-          parts.push(`snippet: ${r.assistantSnippet.replace(/\n/g, " ")}`);
-        }
-        parts.push("→ use read_project_history with this chunkId for full exploration trace");
-        return parts.join("\n");
-      });
-
       return {
         content: [
           {
             type: "text" as const,
-            text:
-              `Project history evidence (${results.length} chunks). Verify current code before modifying.\n\n` +
-              lines.join("\n\n"),
+            text: formatSearchResults(results),
           },
         ],
         details: { results },
@@ -146,14 +126,28 @@ export function registerHistorySearchAlias(pi: ExtensionAPI): void {
         minRelevance?: number;
         minConfidence?: number;
       };
+      const settings = loadSettings(ctx.cwd);
+      if (!settings.enabled) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "history-recall is disabled (enabled=false).",
+            },
+          ],
+          details: { results: [], aliasOf: "search_project_history", diagnostics: "disabled" },
+        };
+      }
       const index = getIndexForCwd(ctx.cwd);
       index.reconcile({ activeSessionId: ctx.sessionManager.getSessionId() });
       const results = searchProjectHistory(index, {
         query: p.query,
         project: index.project,
         maxResults: p.maxResults,
-        minRelevance: p.minRelevance,
-        minConfidence: p.minConfidence,
+        minRelevance: p.minRelevance ?? settings.minRelevance,
+        minConfidence: p.minConfidence ?? settings.minConfidence,
+        freshnessHighDays: settings.freshnessHighDays,
+        freshnessMediumDays: settings.freshnessMediumDays,
         excludeOpen: true,
       });
       return {
@@ -163,12 +157,7 @@ export function registerHistorySearchAlias(pi: ExtensionAPI): void {
             text:
               results.length === 0
                 ? `No matches for ${JSON.stringify(p.query)}.`
-                : results
-                    .map(
-                      (r, i) =>
-                        `[${i + 1}] R:${r.relevance} C:${r.confidence} F:${r.freshness} chunkId=${r.chunkId}\n${r.userText.slice(0, 160)}`,
-                    )
-                    .join("\n\n"),
+                : formatSearchResults(results),
           },
         ],
         details: { results, aliasOf: "search_project_history" },

@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { buildChunksForSession } from "../chunk/builder.ts";
 import { indexDbPath, resolveProjectIdentity } from "../project.ts";
@@ -257,6 +257,8 @@ export class HistoryIndex {
     const delCjk = this.db.prepare("DELETE FROM chunk_fts_cjk WHERE rowid = ?");
     for (const m of cjkMaps) delCjk.run(m.fts_rowid);
 
+    // Session-scoped evidence has chunk_id NULL and is not cascaded via chunks.
+    this.db.prepare("DELETE FROM evidence WHERE session_id = ?").run(sessionId);
     this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
   }
 
@@ -449,8 +451,10 @@ export class HistoryIndex {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const ev of chunk.evidence) {
+      // Session-scoped evidence is stored with null chunk_id and excluded from FTS.
+      const evChunkId = ev.evidenceScope === "session" ? null : (ev.chunkId ?? chunk.id);
       insEv.run(
-        chunk.id,
+        evChunkId,
         sessionId,
         ev.sourceEntryId,
         ev.evidenceType,
@@ -553,4 +557,40 @@ export function clearIndexCache(): void {
     }
   }
   cache.clear();
+}
+
+/**
+ * Delete the disposable SQLite index (+ wal/shm/lock) for this project.
+ * Source Session JSONL is never touched. Safe to call when no writer lease is held
+ * by this process after clearIndexCache().
+ */
+export function clearProjectIndex(cwd: string, agentDir?: string): {
+  dbPath: string;
+  removed: string[];
+} {
+  const project = resolveProjectIdentity(cwd);
+  const key = `${project.projectId}|${agentDir ?? ""}`;
+  const cached = cache.get(key);
+  if (cached) {
+    try {
+      cached.close();
+    } catch {
+      // ignore
+    }
+    cache.delete(key);
+  }
+
+  const dbPath = indexDbPath(project.projectId, project.canonicalCwd, agentDir);
+  const removed: string[] = [];
+  for (const p of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}.lock`]) {
+    try {
+      if (existsSync(p)) {
+        unlinkSync(p);
+        removed.push(p);
+      }
+    } catch {
+      // best-effort
+    }
+  }
+  return { dbPath, removed };
 }
