@@ -22,7 +22,9 @@ Reduce **exploration cost**, not context tokens.
 
 When the user says something like:
 
-> 修改货期规则
+> 更新 README 的更新说明
+> 为扩展增加 rebuild 子命令
+> 修改项目隔离规则
 
 the agent should be able to:
 
@@ -142,9 +144,9 @@ Tool prompts encode: **do not treat history as current truth**.
 Examples:
 
 ```text
-/history-recall 货期规则
-/history-recall JWT token expiration
-/history-recall settings
+/history-recall README update
+/history-recall session index rebuild
+/history-recall project isolation
 /history-recall status
 ```
 
@@ -261,6 +263,44 @@ Pi Session JSONL
 ```
 
 Deep design, acceptance criteria, and non-goals: **[DESIGN.md](./DESIGN.md)**.
+
+---
+
+## Update
+
+There is no standalone update command. Update this extension by reloading the extension code, then rebuild the index if needed.
+
+**Local development checkout**
+
+```bash
+cd /Users/box/dev-code/pi-agent-history-recall
+git pull
+bun install
+bun test
+bun run typecheck
+```
+
+If Pi loads from the current directory, restart Pi after updating the source.
+
+**Reinstall the package**
+
+```bash
+pi install .
+```
+
+**Rebuild the index after updating**
+
+```text
+/history-recall rebuild
+```
+
+Or verify the current state first:
+
+```text
+/history-recall status
+```
+
+The SQLite index is disposable; rebuilding from Session JSONL is safe at any time.
 
 ---
 
