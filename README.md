@@ -39,18 +39,10 @@ Ideal outcome: fewer full-repo greps and fewer cold restarts of the mental model
 
 ## Install
 
-From this package directory:
+Install from Git:
 
 ```bash
-pi install .
-```
-
-Or link / register the package so Pi loads:
-
-```json
-"pi": {
-  "extensions": ["./src/index.ts"]
-}
+pi install https://github.com/youfun/pi-agent-history-recall.git
 ```
 
 Requirements:
@@ -268,9 +260,13 @@ Deep design, acceptance criteria, and non-goals: **[DESIGN.md](./DESIGN.md)**.
 
 ## Update
 
-There is no standalone update command. Update this extension by reloading the extension code, then rebuild the index if needed.
+There is no standalone update command. Update this extension by reinstalling from Git, then rebuild the index if needed.
 
-**Local development checkout**
+```bash
+pi install https://github.com/youfun/pi-agent-history-recall.git
+```
+
+If you want to update the local checkout instead:
 
 ```bash
 cd /Users/box/dev-code/pi-agent-history-recall
@@ -278,14 +274,6 @@ git pull
 bun install
 bun test
 bun run typecheck
-```
-
-If Pi loads from the current directory, restart Pi after updating the source.
-
-**Reinstall the package**
-
-```bash
-pi install .
 ```
 
 **Rebuild the index after updating**
