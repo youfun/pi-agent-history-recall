@@ -142,6 +142,8 @@ Examples:
 /history-recall status
 ```
 
+Daily `search` and `read` calls automatically reconcile incrementally; only a full reset needs manual `rebuild`.
+
 ---
 
 ## Behavior (v1)
@@ -149,16 +151,16 @@ Examples:
 | Area | Behavior |
 |------|----------|
 | **Data source** | Pi Session JSONL only |
-| **Index** | SQLite + FTS5, disposable and rebuildable |
+| **Index** | SQLite + FTS5, disposable and rebuildable; search/read auto-reconcile incrementally |
 | **Project isolation** | `canonical_cwd = NFC(realpath(cwd))`, `project_id = SHA-256(canonical_cwd)`; session `header.cwd` must match |
 | **Retrieval unit** | Conversation Chunk (user → assistant/tools → results on one branch path) |
 | **Branches** | Sibling variants are never merged; over-limit builds **fail closed** and keep the prior revision |
 | **Search** | Dual FTS (Latin + CJK n-grams), path/symbol/error boosts |
 | **Ranking** | Three axes: Relevance, Confidence, Freshness |
 | **Exploration trace** | read / grep / find / list / bash / edit / write / error / exclusion / verification |
-| **Auto hint** | `before_agent_start` may inject a **one-line** hint only when scores are high; never full history |
 | **Privacy** | Secret redaction; sensitive paths filtered; no absolute session paths in tool output |
 | **Concurrency** | Filesystem writer lease so two Pi processes cannot let an old snapshot overwrite a newer index |
+| **Rebuild policy** | `rebuild` is manual full reset; normal use does not require it |
 
 ---
 
@@ -210,11 +212,8 @@ Example project file:
 ```json
 {
   "enabled": true,
-  "hintsEnabled": true,
   "minRelevance": 40,
   "minConfidence": 30,
-  "hintMinRelevance": 80,
-  "hintMinConfidence": 70,
   "freshnessHighDays": 7,
   "freshnessMediumDays": 30
 }
@@ -223,9 +222,7 @@ Example project file:
 | Key | Meaning |
 |-----|---------|
 | `enabled` | Master switch for this scope |
-| `hintsEnabled` | Allow one-line `before_agent_start` hints |
 | `minRelevance` / `minConfidence` | Default search thresholds |
-| `hintMin*` | Thresholds for auto hints |
 | `freshnessHighDays` / `freshnessMediumDays` | Freshness buckets |
 
 `enabled: false` in the **project** file is the intended opt-out for that repo.
@@ -251,7 +248,7 @@ Pi Session JSONL
  retrieve/*         BM25 + boosts → Relevance / Confidence / Freshness
       │
       ▼
- tools + /history-recall + optional before_agent_start hint
+ tools + /history-recall
 ```
 
 Deep design, acceptance criteria, and non-goals: **[DESIGN.md](./DESIGN.md)**.
@@ -278,6 +275,8 @@ bun run typecheck
 
 **Rebuild the index after updating**
 
+Only run this for a full refresh or after deleting index files.
+
 ```text
 /history-recall rebuild
 ```
@@ -289,6 +288,8 @@ Or verify the current state first:
 ```
 
 The SQLite index is disposable; rebuilding from Session JSONL is safe at any time.
+
+Daily search and read operations automatically reconcile incrementally, so manual rebuild is not required for normal use.
 
 ---
 

@@ -150,6 +150,8 @@ read_project_history（针对有希望的 chunkId）
 /history-recall status
 ```
 
+日常搜索和读取时会自动增量 reconcile；只有全量重置才需要手动 `rebuild`。
+
 ---
 
 ## 行为 (v1)
@@ -157,16 +159,16 @@ read_project_history（针对有希望的 chunkId）
 | 领域 | 行为 |
 |------|----------|
 | **数据来源** | 仅 Pi Session JSONL |
-| **索引** | SQLite + FTS5，可丢弃且可重建 |
+| **索引** | SQLite + FTS5，可丢弃且可重建；搜索/读取会自动增量 reconcile |
 | **项目隔离** | `canonical_cwd = NFC(realpath(cwd))`，`project_id = SHA-256(canonical_cwd)`；会话 `header.cwd` 必须匹配 |
 | **检索单元** | 对话块（用户 → 助手/工具 → 一个分支路径上的结果） |
 | **分支** | 同级变体永远不会合并；超限构建 **fail closed** 并保留旧版本 |
 | **搜索** | 双 FTS（Latin + CJK n-grams），路径/符号/错误提升 |
 | **排名** | 三个维度：Relevance、Confidence、Freshness |
 | **探索轨迹** | read / grep / find / list / bash / edit / write / error / exclusion / verification |
-| **自动提示** | `before_agent_start` 仅在分数高时注入 **单行** 提示；绝不注入完整历史 |
 | **隐私** | 密钥脱敏；敏感路径过滤；工具输出尽可能使用项目相对路径 |
 | **并发** | 文件系统 writer lease，防止两个 Pi 进程让旧快照覆盖新索引 |
+| **重建策略** | `rebuild` 是手动全量重置；正常使用不需要 |
 
 ---
 
@@ -218,11 +220,8 @@ read_project_history（针对有希望的 chunkId）
 ```json
 {
   "enabled": true,
-  "hintsEnabled": true,
   "minRelevance": 40,
   "minConfidence": 30,
-  "hintMinRelevance": 80,
-  "hintMinConfidence": 70,
   "freshnessHighDays": 7,
   "freshnessMediumDays": 30
 }
@@ -231,9 +230,6 @@ read_project_history（针对有希望的 chunkId）
 | 键 | 含义 |
 |-----|---------|
 | `enabled` | 该范围的主开关 |
-| `hintsEnabled` | 允许单行 `before_agent_start` 提示 |
-| `minRelevance` / `minConfidence` | 默认搜索阈值 |
-| `hintMin*` | 自动提示的阈值 |
 | `freshnessHighDays` / `freshnessMediumDays` | 新鲜度桶 |
 
 项目文件中的 `enabled: false` 是针对该仓库的预期 opt-out 方式。
@@ -259,10 +255,12 @@ Pi Session JSONL
  retrieve/*          BM25 + boosts → Relevance / Confidence / Freshness
       │
       ▼
- tools + /history-recall + 可选的 before_agent_start 提示
+ tools + /history-recall
 ```
 
 深度设计、验收标准和非目标：**[DESIGN.md](./DESIGN.md)**。
+
+Token 节省、甜点线与记忆角色分析：**[docs/token-savings-and-memory.zh.md](./docs/token-savings-and-memory.zh.md)**。
 
 ---
 
@@ -290,6 +288,8 @@ pi install .
 
 **更新后重建索引**
 
+仅在需要全量刷新或删除索引文件后执行。
+
 ```text
 /history-recall rebuild
 ```
@@ -301,6 +301,8 @@ pi install .
 ```
 
 SQLite 索引是可丢弃的；随时可以从 Session JSONL 安全重建。
+
+日常搜索和读取时会自动增量 reconcile，正常使用不需要手动 rebuild。
 
 ---
 
